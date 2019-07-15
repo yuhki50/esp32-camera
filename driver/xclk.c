@@ -16,7 +16,7 @@ esp_err_t camera_enable_out_clock(camera_config_t* config)
     periph_module_enable(PERIPH_LEDC_MODULE);
 
     ledc_timer_config_t timer_conf;
-    timer_conf.duty_resolution = 2;
+    timer_conf.duty_resolution = (ledc_timer_bit_t)2;
     timer_conf.freq_hz = config->xclk_freq_hz;
     timer_conf.speed_mode = LEDC_HIGH_SPEED_MODE;
     timer_conf.timer_num = config->ledc_timer;

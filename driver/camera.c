@@ -11,6 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include "esp_err.h"
+#include "driver/ledc.h"
+#include "sensor.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +35,7 @@
 #include "esp_intr_alloc.h"
 #include "sensor.h"
 #include "sccb.h"
-#include "esp_camera.h"
+#include "myesp_camera.h"
 #include "camera_common.h"
 #include "xclk.h"
 #if CONFIG_OV2640_SUPPORT
@@ -43,6 +47,12 @@
 #if CONFIG_OV3660_SUPPORT
 #include "ov3660.h"
 #endif
+#if CONFIG_OV5640_SUPPORT
+#include "ov5640.h"
+#endif
+#if CONFIG_OV5642_SUPPORT
+#include "ov5642.h"
+#endif
 
 typedef enum {
     CAMERA_NONE = 0,
@@ -50,6 +60,8 @@ typedef enum {
     CAMERA_OV7725 = 7725,
     CAMERA_OV2640 = 2640,
     CAMERA_OV3660 = 3660,
+    CAMERA_OV5640 = 5640,
+    CAMERA_OV5642 = 5642,
 } camera_model_t;
 
 #define REG_PID        0x0A
@@ -170,12 +182,12 @@ static int IRAM_ATTR _gpio_get_level(gpio_num_t gpio_num)
 
 static void IRAM_ATTR vsync_intr_disable()
 {
-    gpio_set_intr_type(s_state->config.pin_vsync, GPIO_INTR_DISABLE);
+    gpio_set_intr_type((gpio_num_t)s_state->config.pin_vsync, GPIO_INTR_DISABLE);
 }
 
 static void vsync_intr_enable()
 {
-    gpio_set_intr_type(s_state->config.pin_vsync, GPIO_INTR_NEGEDGE);
+    gpio_set_intr_type((gpio_num_t)s_state->config.pin_vsync, GPIO_INTR_NEGEDGE);
 }
 
 static int skip_frame()
@@ -184,17 +196,17 @@ static int skip_frame()
         return -1;
     }
     int64_t st_t = esp_timer_get_time();
-    while (_gpio_get_level(s_state->config.pin_vsync) == 0) {
+    while (_gpio_get_level((gpio_num_t)s_state->config.pin_vsync) == 0) {
         if((esp_timer_get_time() - st_t) > 1000000LL){
             goto timeout;
         }
     }
-    while (_gpio_get_level(s_state->config.pin_vsync) != 0) {
+    while (_gpio_get_level((gpio_num_t)s_state->config.pin_vsync) != 0) {
         if((esp_timer_get_time() - st_t) > 1000000LL){
             goto timeout;
         }
     }
-    while (_gpio_get_level(s_state->config.pin_vsync) == 0) {
+    while (_gpio_get_level((gpio_num_t)s_state->config.pin_vsync) == 0) {
         if((esp_timer_get_time() - st_t) > 1000000LL){
             goto timeout;
         }
@@ -232,32 +244,32 @@ static esp_err_t camera_fb_init(size_t count)
 
     camera_fb_int_t * _fb = NULL, * _fb1 = NULL, * _fb2 = NULL;
     for(size_t i = 0; i < count; i++) {
-        _fb2 = (camera_fb_int_t *)malloc(sizeof(camera_fb_int_t));
+        _fb2 = (camera_fb_int_t *)heap_caps_malloc(sizeof(camera_fb_int_t), MALLOC_CAP_SPIRAM);
         if(!_fb2) {
             goto fail;
         }
         memset(_fb2, 0, sizeof(camera_fb_int_t));
         _fb2->size = s_state->fb_size;
-        _fb2->buf = (uint8_t*) calloc(_fb2->size, 1);
+        _fb2->buf = (uint8_t*) heap_caps_calloc(_fb2->size, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if(!_fb2->buf) {
-            ESP_LOGI(TAG, "Allocating %d KB frame buffer in PSRAM", s_state->fb_size/1024);
+            ESP_LOGI(TAG, "Allocating %d KB frame buffer in PSRAM", s_state->fb_size / 1024);
             _fb2->buf = (uint8_t*) heap_caps_calloc(_fb2->size, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         } else {
-            ESP_LOGI(TAG, "Allocating %d KB frame buffer in OnBoard RAM", s_state->fb_size/1024);
+            ESP_LOGI(TAG, "Allocating %d KB frame buffer in OnBoard RAM", s_state->fb_size / 1024);
         }
         if(!_fb2->buf) {
             free(_fb2);
-            ESP_LOGE(TAG, "Allocating %d KB frame buffer Failed", s_state->fb_size/1024);
+            ESP_LOGE(TAG, "Allocating %d KB frame buffer Failed", s_state->fb_size / 1024);
             goto fail;
         }
         memset(_fb2->buf, 0, _fb2->size);
         _fb2->next = _fb;
         _fb = _fb2;
-        if(!i) {
+        if (!i) {
             _fb1 = _fb2;
         }
     }
-    if(_fb1) {
+    if (_fb1) {
         _fb1->next = _fb;
     }
 
@@ -266,7 +278,7 @@ static esp_err_t camera_fb_init(size_t count)
     return ESP_OK;
 
 fail:
-    while(_fb) {
+    while (_fb) {
         _fb2 = _fb;
         _fb = _fb->next;
         free(_fb2->buf);
@@ -275,11 +287,9 @@ fail:
     return ESP_ERR_NO_MEM;
 }
 
-static esp_err_t dma_desc_init()
-{
+static esp_err_t dma_desc_init() {
     assert(s_state->width % 4 == 0);
-    size_t line_size = s_state->width * s_state->in_bytes_per_pixel *
-                       i2s_bytes_per_sample(s_state->sampling_mode);
+    size_t line_size = s_state->width * s_state->in_bytes_per_pixel * i2s_bytes_per_sample(s_state->sampling_mode);
     ESP_LOGD(TAG, "Line width (for DMA): %d bytes", line_size);
     size_t dma_per_line = 1;
     size_t buf_size = line_size;
@@ -315,8 +325,7 @@ static esp_err_t dma_desc_init()
 
         lldesc_t* pd = &s_state->dma_desc[i];
         pd->length = buf_size;
-        if (s_state->sampling_mode == SM_0A0B_0B0C &&
-                (i + 1) % dma_per_line == 0) {
+        if (s_state->sampling_mode == SM_0A0B_0B0C && (i + 1) % dma_per_line == 0) {
             pd->length -= 4;
         }
         dma_sample_count += pd->length / 4;
@@ -333,8 +342,7 @@ static esp_err_t dma_desc_init()
     return ESP_OK;
 }
 
-static void dma_desc_deinit()
-{
+static void dma_desc_deinit() {
     if (s_state->dma_buf) {
         for (int i = 0; i < s_state->dma_desc_count; ++i) {
             free(s_state->dma_buf[i]);
@@ -347,12 +355,12 @@ static void dma_desc_deinit()
 static inline void IRAM_ATTR i2s_conf_reset()
 {
     const uint32_t lc_conf_reset_flags = I2S_IN_RST_M | I2S_AHBM_RST_M
-                                         | I2S_AHBM_FIFO_RST_M;
+                                                                             | I2S_AHBM_FIFO_RST_M;
     I2S0.lc_conf.val |= lc_conf_reset_flags;
     I2S0.lc_conf.val &= ~lc_conf_reset_flags;
 
     const uint32_t conf_reset_flags = I2S_RX_RESET_M | I2S_RX_FIFO_RESET_M
-                                      | I2S_TX_RESET_M | I2S_TX_FIFO_RESET_M;
+                                                                        | I2S_TX_RESET_M | I2S_TX_FIFO_RESET_M;
     I2S0.conf.val |= conf_reset_flags;
     I2S0.conf.val &= ~conf_reset_flags;
     while (I2S0.state.rx_fifo_reset_back) {
@@ -360,30 +368,28 @@ static inline void IRAM_ATTR i2s_conf_reset()
     }
 }
 
-static void i2s_init()
-{
+static void i2s_init() {
     camera_config_t* config = &s_state->config;
 
     // Configure input GPIOs
     gpio_num_t pins[] = {
-        config->pin_d7,
-        config->pin_d6,
-        config->pin_d5,
-        config->pin_d4,
-        config->pin_d3,
-        config->pin_d2,
-        config->pin_d1,
-        config->pin_d0,
-        config->pin_vsync,
-        config->pin_href,
-        config->pin_pclk
+        (gpio_num_t)config->pin_d7,
+        (gpio_num_t)config->pin_d6,
+        (gpio_num_t)config->pin_d5,
+        (gpio_num_t)config->pin_d4,
+        (gpio_num_t)config->pin_d3,
+        (gpio_num_t)config->pin_d2,
+        (gpio_num_t)config->pin_d1,
+        (gpio_num_t)config->pin_d0,
+        (gpio_num_t)config->pin_vsync,
+        (gpio_num_t)config->pin_href,
+        (gpio_num_t)config->pin_pclk
     };
-    gpio_config_t conf = {
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
+    gpio_config_t conf;
+    conf.mode = GPIO_MODE_INPUT;
+    conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    conf.intr_type = GPIO_INTR_DISABLE;
     for (int i = 0; i < sizeof(pins) / sizeof(gpio_num_t); ++i) {
         if (rtc_gpio_is_valid_gpio(pins[i])) {
             rtc_gpio_deinit(pins[i]);
@@ -402,7 +408,7 @@ static void i2s_init()
     gpio_matrix_in(config->pin_d6, I2S0I_DATA_IN6_IDX, false);
     gpio_matrix_in(config->pin_d7, I2S0I_DATA_IN7_IDX, false);
     gpio_matrix_in(config->pin_vsync, I2S0I_V_SYNC_IDX, false);
-    gpio_matrix_in(0x38, I2S0I_H_SYNC_IDX, false);
+    gpio_matrix_in(0x38, I2S0I_H_SYNC_IDX, false); // HSYNC is set to constant high
     gpio_matrix_in(config->pin_href, I2S0I_H_ENABLE_IDX, false);
     gpio_matrix_in(config->pin_pclk, I2S0I_WS_IN_IDX, false);
 
@@ -439,12 +445,11 @@ static void i2s_init()
 
     // Allocate I2S interrupt, keep it disabled
     esp_intr_alloc(ETS_I2S0_INTR_SOURCE,
-                   ESP_INTR_FLAG_INTRDISABLED | ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM,
-                   &i2s_isr, NULL, &s_state->i2s_intr_handle);
+                                 ESP_INTR_FLAG_INTRDISABLED | ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM,
+                                 &i2s_isr, NULL, &s_state->i2s_intr_handle);
 }
 
-static void IRAM_ATTR i2s_start_bus()
-{
+static void IRAM_ATTR i2s_start_bus() {
     s_state->dma_desc_cur = 0;
     s_state->dma_received_count = 0;
     //s_state->dma_filtered_count = 0;
@@ -465,22 +470,21 @@ static void IRAM_ATTR i2s_start_bus()
     }
 }
 
-static int i2s_run()
-{
+static int i2s_run() {
     for (int i = 0; i < s_state->dma_desc_count; ++i) {
         lldesc_t* d = &s_state->dma_desc[i];
         ESP_LOGV(TAG, "DMA desc %2d: %u %u %u %u %u %u %p %p",
-                 i, d->length, d->size, d->offset, d->eof, d->sosf, d->owner, d->buf, d->qe.stqe_next);
+                         i, d->length, d->size, d->offset, d->eof, d->sosf, d->owner, d->buf, d->qe.stqe_next);
         memset(s_state->dma_buf[i], 0, d->length);
     }
 
     // wait for frame
     camera_fb_int_t * fb = s_state->fb;
-    while(s_state->config.fb_count > 1) {
-        while(s_state->fb->ref && s_state->fb->next != fb) {
+    while (s_state->config.fb_count > 1) {
+        while (s_state->fb->ref && s_state->fb->next != fb) {
             s_state->fb = s_state->fb->next;
         }
-        if(s_state->fb->ref == 0) {
+        if (s_state->fb->ref == 0) {
             break;
         }
         vTaskDelay(2);
@@ -490,8 +494,8 @@ static int i2s_run()
     ESP_LOGV(TAG, "Waiting for negative edge on VSYNC");
 
     int64_t st_t = esp_timer_get_time();
-    while (_gpio_get_level(s_state->config.pin_vsync) != 0) {
-        if((esp_timer_get_time() - st_t) > 1000000LL){
+    while (_gpio_get_level((gpio_num_t)s_state->config.pin_vsync) != 0) {
+        if ((esp_timer_get_time() - st_t) > 1000000LL) {
             ESP_LOGE(TAG, "Timeout waiting for VSYNC");
             return -1;
         }
@@ -511,7 +515,7 @@ static void IRAM_ATTR i2s_stop_bus()
 
 static void IRAM_ATTR i2s_stop(bool* need_yield)
 {
-    if(s_state->config.fb_count == 1 && !s_state->fb->bad) {
+    if (s_state->config.fb_count == 1 && !s_state->fb->bad) {
         i2s_stop_bus();
     } else {
         s_state->dma_received_count = 0;
@@ -520,24 +524,25 @@ static void IRAM_ATTR i2s_stop(bool* need_yield)
     size_t val = SIZE_MAX;
     BaseType_t higher_priority_task_woken;
     BaseType_t ret = xQueueSendFromISR(s_state->data_ready, &val, &higher_priority_task_woken);
-    if(need_yield && !*need_yield) {
+    if (need_yield && !*need_yield) {
         *need_yield = (ret == pdTRUE && higher_priority_task_woken == pdTRUE);
     }
 }
 
 static void IRAM_ATTR signal_dma_buf_received(bool* need_yield)
 {
+    // ESP_LOGV(TAG, "signal_dma_buf_received");
     size_t dma_desc_filled = s_state->dma_desc_cur;
     s_state->dma_desc_cur = (dma_desc_filled + 1) % s_state->dma_desc_count;
     s_state->dma_received_count++;
-    if(!s_state->fb->ref && s_state->fb->bad){
+    if (!s_state->fb->ref && s_state->fb->bad) {
         *need_yield = false;
         return;
     }
     BaseType_t higher_priority_task_woken;
     BaseType_t ret = xQueueSendFromISR(s_state->data_ready, &dma_desc_filled, &higher_priority_task_woken);
     if (ret != pdTRUE) {
-        if(!s_state->fb->ref) {
+        if (!s_state->fb->ref) {
             s_state->fb->bad = 1;
         }
         //ESP_EARLY_LOGW(TAG, "qsf:%d", s_state->dma_received_count);
@@ -552,7 +557,7 @@ static void IRAM_ATTR i2s_isr(void* arg)
     bool need_yield = false;
     signal_dma_buf_received(&need_yield);
     if (s_state->config.pixel_format != PIXFORMAT_JPEG
-     && s_state->dma_received_count == s_state->height * s_state->dma_per_line) {
+            && s_state->dma_received_count == s_state->height * s_state->dma_per_line) {
         i2s_stop(&need_yield);
     }
     if (need_yield) {
@@ -560,21 +565,21 @@ static void IRAM_ATTR i2s_isr(void* arg)
     }
 }
 
-static void IRAM_ATTR vsync_isr(void* arg)
-{
+static void IRAM_ATTR vsync_isr(void* arg) {
+    ESP_LOGV(TAG, "vsync_isr");
     GPIO.status1_w1tc.val = GPIO.status1.val;
     GPIO.status_w1tc = GPIO.status;
     bool need_yield = false;
     //if vsync is low and we have received some data, frame is done
-    if (_gpio_get_level(s_state->config.pin_vsync) == 0) {
-        if(s_state->dma_received_count > 0) {
+    if (_gpio_get_level((gpio_num_t)s_state->config.pin_vsync) == 0) {
+        if (s_state->dma_received_count > 0) {
             signal_dma_buf_received(&need_yield);
             //ets_printf("end_vsync\n");
-            if(s_state->dma_filtered_count > 1 || s_state->config.fb_count > 1) {
+            if (s_state->dma_filtered_count > 1 || s_state->config.fb_count > 1) {
                 i2s_stop(&need_yield);
             }
         }
-        if(s_state->config.fb_count > 1 || s_state->dma_filtered_count < 2) {
+        if (s_state->config.fb_count > 1 || s_state->dma_filtered_count < 2) {
             I2S0.conf.rx_start = 0;
             I2S0.in_link.start = 0;
             I2S0.int_clr.val = I2S0.int_raw.val;
@@ -597,20 +602,20 @@ static void IRAM_ATTR camera_fb_done()
     camera_fb_int_t * fb = NULL, * fb2 = NULL;
     BaseType_t taskAwoken = 0;
 
-    if(s_state->config.fb_count == 1) {
+    if (s_state->config.fb_count == 1) {
         xSemaphoreGive(s_state->frame_ready);
         return;
     }
 
     fb = s_state->fb;
-    if(!fb->ref && fb->len) {
+    if (!fb->ref && fb->len) {
         //add reference
         fb->ref = 1;
 
         //check if the queue is full
-        if(xQueueIsQueueFullFromISR(s_state->fb_out) == pdTRUE) {
+        if (xQueueIsQueueFullFromISR(s_state->fb_out) == pdTRUE) {
             //pop frame buffer from the queue
-            if(xQueueReceiveFromISR(s_state->fb_out, &fb2, &taskAwoken) == pdTRUE) {
+            if (xQueueReceiveFromISR(s_state->fb_out, &fb2, &taskAwoken) == pdTRUE) {
                 //free the popped buffer
                 fb2->ref = 0;
                 fb2->len = 0;
@@ -628,21 +633,21 @@ static void IRAM_ATTR camera_fb_done()
     }
 
     //return buffers to be filled
-    while(xQueueReceiveFromISR(s_state->fb_in, &fb2, &taskAwoken) == pdTRUE) {
+    while (xQueueReceiveFromISR(s_state->fb_in, &fb2, &taskAwoken) == pdTRUE) {
         fb2->ref = 0;
         fb2->len = 0;
     }
 
     //advance frame buffer only if the current one has data
-    if(s_state->fb->len) {
+    if (s_state->fb->len) {
         s_state->fb = s_state->fb->next;
     }
     //try to find the next free frame buffer
-    while(s_state->fb->ref && s_state->fb->next != fb) {
+    while (s_state->fb->ref && s_state->fb->next != fb) {
         s_state->fb = s_state->fb->next;
     }
     //is the found frame buffer free?
-    if(!s_state->fb->ref) {
+    if (!s_state->fb->ref) {
         //buffer found. make sure it's empty
         s_state->fb->len = 0;
         *((uint32_t *)s_state->fb->buf) = 0;
@@ -655,30 +660,30 @@ static void IRAM_ATTR camera_fb_done()
 static void IRAM_ATTR dma_finish_frame()
 {
     size_t buf_len = s_state->width * s_state->fb_bytes_per_pixel / s_state->dma_per_line;
-
-    if(!s_state->fb->ref) {
+    //  ESP_LOGV(TAG, "dma_finish_frame()");
+    if (!s_state->fb->ref) {
         // is the frame bad?
-        if(s_state->fb->bad){
+        if (s_state->fb->bad) {
             s_state->fb->bad = 0;
             s_state->fb->len = 0;
             *((uint32_t *)s_state->fb->buf) = 0;
-            if(s_state->config.fb_count == 1) {
+            if (s_state->config.fb_count == 1) {
                 i2s_start_bus();
             }
         } else {
             s_state->fb->len = s_state->dma_filtered_count * buf_len;
-            if(s_state->fb->len) {
+            if (s_state->fb->len) {
                 //find the end marker for JPEG. Data after that can be discarded
-                if(s_state->fb->format == PIXFORMAT_JPEG){
+                if (s_state->fb->format == PIXFORMAT_JPEG) {
                     uint8_t * dptr = &s_state->fb->buf[s_state->fb->len - 1];
-                    while(dptr > s_state->fb->buf){
-                        if(dptr[0] == 0xFF && dptr[1] == 0xD9 && dptr[2] == 0x00 && dptr[3] == 0x00){
+                    while (dptr > s_state->fb->buf) {
+                        if (dptr[0] == 0xFF && dptr[1] == 0xD9 && dptr[2] == 0x00 && dptr[3] == 0x00) {
                             dptr += 2;
                             s_state->fb->len = dptr - s_state->fb->buf;
-                            if((s_state->fb->len & 0x1FF) == 0){
+                            if ((s_state->fb->len & 0x1FF) == 0) {
                                 s_state->fb->len += 1;
                             }
-                            if((s_state->fb->len % 100) == 0){
+                            if ((s_state->fb->len % 100) == 0) {
                                 s_state->fb->len += 1;
                             }
                             break;
@@ -688,12 +693,12 @@ static void IRAM_ATTR dma_finish_frame()
                 }
                 //send out the frame
                 camera_fb_done();
-            } else if(s_state->config.fb_count == 1){
+            } else if (s_state->config.fb_count == 1) {
                 //frame was empty?
                 i2s_start_bus();
             }
         }
-    } else if(s_state->fb->len) {
+    } else if (s_state->fb->len) {
         camera_fb_done();
     }
     s_state->dma_filtered_count = 0;
@@ -702,14 +707,14 @@ static void IRAM_ATTR dma_finish_frame()
 static void IRAM_ATTR dma_filter_buffer(size_t buf_idx)
 {
     //no need to process the data if frame is in use or is bad
-    if(s_state->fb->ref || s_state->fb->bad) {
+    if (s_state->fb->ref || s_state->fb->bad) {
         return;
     }
 
     //check if there is enough space in the frame buffer for the new data
     size_t buf_len = s_state->width * s_state->fb_bytes_per_pixel / s_state->dma_per_line;
     size_t fb_pos = s_state->dma_filtered_count * buf_len;
-    if(fb_pos > s_state->fb_size - buf_len) {
+    if (fb_pos > s_state->fb_size - buf_len) {
         //size_t processed = s_state->dma_received_count * buf_len;
         //ets_printf("[%s:%u] ovf pos: %u, processed: %u\n", __FUNCTION__, __LINE__, fb_pos, processed);
         return;
@@ -719,11 +724,11 @@ static void IRAM_ATTR dma_filter_buffer(size_t buf_idx)
     (*s_state->dma_filter)(s_state->dma_buf[buf_idx], &s_state->dma_desc[buf_idx], s_state->fb->buf + fb_pos);
 
     //first frame buffer
-    if(!s_state->dma_filtered_count) {
+    if (!s_state->dma_filtered_count) {
         //check for correct JPEG header
-        if(s_state->sensor.pixformat == PIXFORMAT_JPEG) {
+        if (s_state->sensor.pixformat == PIXFORMAT_JPEG) {
             uint32_t sig = *((uint32_t *)s_state->fb->buf) & 0xFFFFFF;
-            if(sig != 0xffd8ff) {
+            if (sig != 0xffd8ff) {
                 //ets_printf("bad header\n");
                 s_state->fb->bad = 1;
                 return;
@@ -737,12 +742,13 @@ static void IRAM_ATTR dma_filter_buffer(size_t buf_idx)
     s_state->dma_filtered_count++;
 }
 
-static void IRAM_ATTR dma_filter_task(void *pvParameters)
-{
+static void IRAM_ATTR dma_filter_task(void *pvParameters) {
     s_state->dma_filtered_count = 0;
     while (true) {
         size_t buf_idx;
-        if(xQueueReceive(s_state->data_ready, &buf_idx, portMAX_DELAY) == pdTRUE) {
+             // ESP_LOGV(TAG, "Filter task");
+        if (xQueueReceive(s_state->data_ready, &buf_idx, portMAX_DELAY) == pdTRUE) {
+                     // ESP_LOGV(TAG, "Filter task READY");
             if (buf_idx == SIZE_MAX) {
                 //this is the end of the frame
                 dma_finish_frame();
@@ -753,8 +759,7 @@ static void IRAM_ATTR dma_filter_task(void *pvParameters)
     }
 }
 
-static void IRAM_ATTR dma_filter_jpeg(const dma_elem_t* src, lldesc_t* dma_desc, uint8_t* dst)
-{
+static void IRAM_ATTR dma_filter_jpeg(const dma_elem_t* src, lldesc_t* dma_desc, uint8_t* dst) {
     size_t end = dma_desc->length / sizeof(dma_elem_t) / 4;
     // manually unrolling 4 iterations of the loop here
     for (size_t i = 0; i < end; ++i) {
@@ -767,8 +772,7 @@ static void IRAM_ATTR dma_filter_jpeg(const dma_elem_t* src, lldesc_t* dma_desc,
     }
 }
 
-static void IRAM_ATTR dma_filter_grayscale(const dma_elem_t* src, lldesc_t* dma_desc, uint8_t* dst)
-{
+static void IRAM_ATTR dma_filter_grayscale(const dma_elem_t* src, lldesc_t* dma_desc, uint8_t* dst) {
     size_t end = dma_desc->length / sizeof(dma_elem_t) / 4;
     for (size_t i = 0; i < end; ++i) {
         // manually unrolling 4 iterations of the loop here
@@ -781,8 +785,7 @@ static void IRAM_ATTR dma_filter_grayscale(const dma_elem_t* src, lldesc_t* dma_
     }
 }
 
-static void IRAM_ATTR dma_filter_grayscale_highspeed(const dma_elem_t* src, lldesc_t* dma_desc, uint8_t* dst)
-{
+static void IRAM_ATTR dma_filter_grayscale_highspeed(const dma_elem_t* src, lldesc_t* dma_desc, uint8_t* dst) {
     size_t end = dma_desc->length / sizeof(dma_elem_t) / 8;
     for (size_t i = 0; i < end; ++i) {
         // manually unrolling 4 iterations of the loop here
@@ -922,127 +925,80 @@ static void IRAM_ATTR dma_filter_rgb888_highspeed(const dma_elem_t* src, lldesc_
     }
 }
 
-/*
- * Public Methods
- * */
-
 esp_err_t camera_probe(const camera_config_t* config, camera_model_t* out_camera_model)
 {
     if (s_state != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_state = (camera_state_t*) calloc(sizeof(*s_state), 1);
+    s_state = (camera_state_t*) heap_caps_calloc(sizeof(*s_state), 1, MALLOC_CAP_SPIRAM);
     if (!s_state) {
         return ESP_ERR_NO_MEM;
     }
 
     ESP_LOGD(TAG, "Enabling XCLK output");
-    camera_enable_out_clock(config);
+    camera_enable_out_clock((camera_config_t*)config);
 
     ESP_LOGD(TAG, "Initializing SSCB");
-    SCCB_Init(config->pin_sscb_sda, config->pin_sscb_scl);
-	
-    if(config->pin_pwdn >= 0) {
+    SCCB_Init((gpio_num_t)config->pin_sscb_sda, (gpio_num_t)config->pin_sscb_scl);
+
+    if (config->pin_pwdn >= 0) {
         ESP_LOGD(TAG, "Resetting camera by power down line");
         gpio_config_t conf = { 0 };
-        conf.pin_bit_mask = 1LL << config->pin_pwdn;
+        conf.pin_bit_mask = 1LL << (gpio_num_t)config->pin_pwdn;
         conf.mode = GPIO_MODE_OUTPUT;
         gpio_config(&conf);
 
         // carefull, logic is inverted compared to reset pin
-        gpio_set_level(config->pin_pwdn, 1);
+        gpio_set_level((gpio_num_t)config->pin_pwdn, 1);
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        gpio_set_level(config->pin_pwdn, 0);
+        gpio_set_level((gpio_num_t)config->pin_pwdn, 0);
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
-    if(config->pin_reset >= 0) {
+    if (config->pin_reset >= 0) {
         ESP_LOGD(TAG, "Resetting camera");
         gpio_config_t conf = { 0 };
         conf.pin_bit_mask = 1LL << config->pin_reset;
         conf.mode = GPIO_MODE_OUTPUT;
         gpio_config(&conf);
 
-        gpio_set_level(config->pin_reset, 0);
+        gpio_set_level((gpio_num_t)config->pin_reset, 0);
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        gpio_set_level(config->pin_reset, 1);
+        gpio_set_level((gpio_num_t)config->pin_reset, 1);
         vTaskDelay(10 / portTICK_PERIOD_MS);
-#if (CONFIG_OV2640_SUPPORT && !CONFIG_OV3660_SUPPORT)
-    } else {
-        //reset OV2640
-        SCCB_Write(0x30, 0xFF, 0x01);//bank sensor
-        SCCB_Write(0x30, 0x12, 0x80);//reset
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-#endif
     }
 
     ESP_LOGD(TAG, "Searching for camera address");
     vTaskDelay(10 / portTICK_PERIOD_MS);
     uint8_t slv_addr = SCCB_Probe();
+    // uint8_t slv_addr = 0x3c;
     if (slv_addr == 0) {
         *out_camera_model = CAMERA_NONE;
         camera_disable_out_clock();
+        ESP_LOGE(TAG, "Camera not detected");
         return ESP_ERR_CAMERA_NOT_DETECTED;
     }
     s_state->sensor.slv_addr = slv_addr;
     s_state->sensor.xclk_freq_hz = config->xclk_freq_hz;
 
-    //s_state->sensor.slv_addr = 0x30;
-    ESP_LOGD(TAG, "Detected camera at address=0x%02x", s_state->sensor.slv_addr);
+    ESP_LOGD(TAG, "Detected camera device at address=0x%02x", s_state->sensor.slv_addr);
     sensor_id_t* id = &s_state->sensor.id;
 
-#if (CONFIG_OV2640_SUPPORT && CONFIG_OV3660_SUPPORT)
-    if (slv_addr == 0x30) {
-        ESP_LOGD(TAG, "Resetting OV2640");
-        //camera might be OV2640. try to reset it
-        SCCB_Write(0x30, 0xFF, 0x01);//bank sensor
-        SCCB_Write(0x30, 0x12, 0x80);//reset
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-        slv_addr = SCCB_Probe();
-    }
-#endif
-
-#if CONFIG_OV3660_SUPPORT
-    if(s_state->sensor.slv_addr == 0x3c){
+    if (s_state->sensor.slv_addr == 0x3c) {
         id->PID = SCCB_Read16(s_state->sensor.slv_addr, REG16_CHIDH);
         id->VER = SCCB_Read16(s_state->sensor.slv_addr, REG16_CHIDL);
         vTaskDelay(10 / portTICK_PERIOD_MS);
         ESP_LOGD(TAG, "Camera PID=0x%02x VER=0x%02x", id->PID, id->VER);
-    } else {
-#endif
-        id->PID = SCCB_Read(s_state->sensor.slv_addr, REG_PID);
-        id->VER = SCCB_Read(s_state->sensor.slv_addr, REG_VER);
-        id->MIDL = SCCB_Read(s_state->sensor.slv_addr, REG_MIDL);
-        id->MIDH = SCCB_Read(s_state->sensor.slv_addr, REG_MIDH);
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-        ESP_LOGD(TAG, "Camera PID=0x%02x VER=0x%02x MIDL=0x%02x MIDH=0x%02x",
-                 id->PID, id->VER, id->MIDH, id->MIDL);
-#if CONFIG_OV3660_SUPPORT
     }
-#endif
 
-
-    switch (id->PID) {
-#if CONFIG_OV2640_SUPPORT
-    case OV2640_PID:
-        *out_camera_model = CAMERA_OV2640;
-        ov2640_init(&s_state->sensor);
-        break;
-#endif
-#if CONFIG_OV7725_SUPPORT
-    case OV7725_PID:
-        *out_camera_model = CAMERA_OV7725;
-        ov7725_init(&s_state->sensor);
-        break;
-#endif
-#if CONFIG_OV3660_SUPPORT
-    case OV3660_PID:
-        *out_camera_model = CAMERA_OV3660;
-        ov3660_init(&s_state->sensor);
-        break;
-#endif
-    default:
+    if (id->PID == OV5640_PID && id->VER == 0x40) {
+        *out_camera_model = CAMERA_OV5640;
+        ov5640_init(&s_state->sensor);
+    } else if (id->PID == OV5642_PID && id->VER == 0x42) {
+        *out_camera_model = CAMERA_OV5642;
+        ov5642_init(&s_state->sensor);
+    } else {
         id->PID = 0;
         *out_camera_model = CAMERA_UNKNOWN;
         camera_disable_out_clock();
@@ -1056,8 +1012,10 @@ esp_err_t camera_probe(const camera_config_t* config, camera_model_t* out_camera
     return ESP_OK;
 }
 
-esp_err_t camera_init(const camera_config_t* config)
-{
+// prototype
+esp_err_t esp_camera_deinit();
+
+esp_err_t camera_init(const camera_config_t* config) {
     if (!s_state) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -1083,7 +1041,7 @@ esp_err_t camera_init(const camera_config_t* config)
             }
             s_state->in_bytes_per_pixel = 1;       // camera sends Y8
         } else {
-            if (is_hs_mode() && s_state->sensor.id.PID != OV7725_PID) {
+            if (is_hs_mode()) {
                 s_state->sampling_mode = SM_0A00_0B00;
                 s_state->dma_filter = &dma_filter_grayscale_highspeed;
             } else {
@@ -1095,7 +1053,7 @@ esp_err_t camera_init(const camera_config_t* config)
         s_state->fb_bytes_per_pixel = 1;       // frame buffer stores Y8
     } else if (pix_format == PIXFORMAT_YUV422 || pix_format == PIXFORMAT_RGB565) {
         s_state->fb_size = s_state->width * s_state->height * 2;
-        if (is_hs_mode() && s_state->sensor.id.PID != OV7725_PID) {
+        if (is_hs_mode()) {
             s_state->sampling_mode = SM_0A00_0B00;
             s_state->dma_filter = &dma_filter_yuyv_highspeed;
         } else {
@@ -1116,8 +1074,8 @@ esp_err_t camera_init(const camera_config_t* config)
         s_state->in_bytes_per_pixel = 2;       // camera sends RGB565
         s_state->fb_bytes_per_pixel = 3;       // frame buffer stores RGB888
     } else if (pix_format == PIXFORMAT_JPEG) {
-        if (s_state->sensor.id.PID != OV2640_PID && s_state->sensor.id.PID != OV3660_PID) {
-            ESP_LOGE(TAG, "JPEG format is only supported for ov2640 and ov3660");
+        if (s_state->sensor.id.PID != OV2640_PID && s_state->sensor.id.PID != OV3660_PID && s_state->sensor.id.PID != OV5642_PID && s_state->sensor.id.PID != OV5640_PID) {
+            ESP_LOGE(TAG, "JPEG format is only supported for ov2640, ov3660, ov5642 and ov5640");
             err = ESP_ERR_NOT_SUPPORTED;
             goto fail;
         }
@@ -1130,7 +1088,7 @@ esp_err_t camera_init(const camera_config_t* config)
         } else {
             compression_ratio_bound = 4;
         }
-        (*s_state->sensor.set_quality)(&s_state->sensor, qp);
+     (*s_state->sensor.set_quality)(&s_state->sensor, qp);
         s_state->in_bytes_per_pixel = 2;
         s_state->fb_bytes_per_pixel = 2;
         s_state->fb_size = (s_state->width * s_state->height * s_state->fb_bytes_per_pixel) / compression_ratio_bound;
@@ -1143,9 +1101,9 @@ esp_err_t camera_init(const camera_config_t* config)
     }
 
     ESP_LOGD(TAG, "in_bpp: %d, fb_bpp: %d, fb_size: %d, mode: %d, width: %d height: %d",
-             s_state->in_bytes_per_pixel, s_state->fb_bytes_per_pixel,
-             s_state->fb_size, s_state->sampling_mode,
-             s_state->width, s_state->height);
+                     s_state->in_bytes_per_pixel, s_state->fb_bytes_per_pixel,
+                     s_state->fb_size, s_state->sampling_mode,
+                     s_state->width, s_state->height);
 
     i2s_init();
 
@@ -1169,7 +1127,7 @@ esp_err_t camera_init(const camera_config_t* config)
         goto fail;
     }
 
-    if(s_state->config.fb_count == 1) {
+    if (s_state->config.fb_count == 1) {
         s_state->frame_ready = xSemaphoreCreateBinary();
         if (s_state->frame_ready == NULL) {
             ESP_LOGE(TAG, "Failed to create semaphore");
@@ -1185,7 +1143,6 @@ esp_err_t camera_init(const camera_config_t* config)
             goto fail;
         }
     }
-
     //ToDo: core affinity?
 #if CONFIG_CAMERA_CORE0
     if (!xTaskCreatePinnedToCore(&dma_filter_task, "dma_filter", 4096, NULL, 10, &s_state->dma_filter_task, 0))
@@ -1202,7 +1159,7 @@ esp_err_t camera_init(const camera_config_t* config)
 
     vsync_intr_disable();
     gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM);
-    err = gpio_isr_handler_add(s_state->config.pin_vsync, &vsync_isr, NULL);
+    err = gpio_isr_handler_add((gpio_num_t)s_state->config.pin_vsync, &vsync_isr, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "vsync_isr_handler_add failed (%x)", err);
         goto fail;
@@ -1210,13 +1167,13 @@ esp_err_t camera_init(const camera_config_t* config)
 
     s_state->sensor.status.framesize = frame_size;
     s_state->sensor.pixformat = pix_format;
-    ESP_LOGD(TAG, "Setting frame size to %dx%d", s_state->width, s_state->height);
-    if (s_state->sensor.set_framesize(&s_state->sensor, frame_size) != 0) {
-        ESP_LOGE(TAG, "Failed to set frame size");
-        err = ESP_ERR_CAMERA_FAILED_TO_SET_FRAME_SIZE;
-        goto fail;
-    }
-    s_state->sensor.set_pixformat(&s_state->sensor, pix_format);
+     // ESP_LOGD(TAG, "Setting frame size to %dx%d", s_state->width, s_state->height);
+     // if (s_state->sensor.set_framesize(&s_state->sensor, frame_size) != 0) {
+     //   ESP_LOGE(TAG, "Failed to set frame size");
+     //   err = ESP_ERR_CAMERA_FAILED_TO_SET_FRAME_SIZE;
+     //   goto fail;
+     // }
+     // s_state->sensor.set_pixformat(&s_state->sensor, pix_format);
 
     if (s_state->sensor.id.PID == OV2640_PID) {
         s_state->sensor.set_gainceiling(&s_state->sensor, GAINCEILING_2X);
@@ -1236,6 +1193,8 @@ esp_err_t camera_init(const camera_config_t* config)
     s_state->sensor.init_status(&s_state->sensor);
     return ESP_OK;
 
+    SCCB_Deinit();
+
 fail:
     esp_camera_deinit();
     return err;
@@ -1245,13 +1204,10 @@ esp_err_t esp_camera_init(const camera_config_t* config)
 {
     camera_model_t camera_model = CAMERA_NONE;
     esp_err_t err = camera_probe(config, &camera_model);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera probe failed with error 0x%x", err);
-        goto fail;
-    }
+
     if (camera_model == CAMERA_OV7725) {
         ESP_LOGD(TAG, "Detected OV7725 camera");
-        if(config->pixel_format == PIXFORMAT_JPEG) {
+        if (config->pixel_format == PIXFORMAT_JPEG) {
             ESP_LOGE(TAG, "Camera does not support JPEG");
             err = ESP_ERR_CAMERA_NOT_SUPPORTED;
             goto fail;
@@ -1260,6 +1216,10 @@ esp_err_t esp_camera_init(const camera_config_t* config)
         ESP_LOGD(TAG, "Detected OV2640 camera");
     } else if (camera_model == CAMERA_OV3660) {
         ESP_LOGD(TAG, "Detected OV3660 camera");
+    } else if (camera_model == CAMERA_OV5642) {
+        ESP_LOGD(TAG, "Detected OV5642 camera");
+    } else if (camera_model == CAMERA_OV5640) {
+        ESP_LOGD(TAG, "Detected OV5640 camera");
     } else {
         ESP_LOGE(TAG, "Camera not supported");
         err = ESP_ERR_CAMERA_NOT_SUPPORTED;
@@ -1268,7 +1228,7 @@ esp_err_t esp_camera_init(const camera_config_t* config)
     err = camera_init(config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
-        return err;
+        goto fail;
     }
     return ESP_OK;
 
@@ -1299,7 +1259,7 @@ esp_err_t esp_camera_deinit()
     if (s_state->frame_ready) {
         vSemaphoreDelete(s_state->frame_ready);
     }
-    gpio_isr_handler_remove(s_state->config.pin_vsync);
+    gpio_isr_handler_remove((gpio_num_t)s_state->config.pin_vsync);
     if (s_state->i2s_intr_handle) {
         esp_intr_disable(s_state->i2s_intr_handle);
         esp_intr_free(s_state->i2s_intr_handle);
@@ -1315,11 +1275,12 @@ esp_err_t esp_camera_deinit()
 
 camera_fb_t* esp_camera_fb_get()
 {
+    ESP_LOGV(TAG, "esp_camera_fb_get");
     if (s_state == NULL) {
         return NULL;
     }
-    if(!I2S0.conf.rx_start) {
-        if(s_state->config.fb_count > 1) {
+    if (!I2S0.conf.rx_start) {
+        if (s_state->config.fb_count > 1) {
             ESP_LOGD(TAG, "i2s_run");
         }
         if (i2s_run() != 0) {
@@ -1327,14 +1288,19 @@ camera_fb_t* esp_camera_fb_get()
         }
     }
     if(s_state->config.fb_count == 1) {
-        xSemaphoreTake(s_state->frame_ready, portMAX_DELAY);
+        ESP_LOGV(TAG, "xSemaphoreTake");
+        xSemaphoreTake(s_state->frame_ready, ( TickType_t ) s_state->config.fb_get_timeout * 1000);
     }
     if(s_state->config.fb_count == 1) {
+        ESP_LOGV(TAG, "return");
         return (camera_fb_t*)s_state->fb;
     }
     camera_fb_int_t * fb = NULL;
     if(s_state->fb_out) {
-        xQueueReceive(s_state->fb_out, &fb, portMAX_DELAY);
+        ESP_LOGV(TAG, "xQueueReceive");
+        if (xQueueReceive(s_state->fb_out, &fb, ( TickType_t ) s_state->config.fb_get_timeout * 1000) == pdFALSE) {
+            return NULL;
+        }
     }
     return (camera_fb_t*)fb;
 }

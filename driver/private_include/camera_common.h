@@ -9,8 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "esp_camera.h"
-#include "sensor.h"
+#include "myesp_camera.h"
 
 typedef union {
     struct {

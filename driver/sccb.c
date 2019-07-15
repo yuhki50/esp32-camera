@@ -6,18 +6,23 @@
  * SCCB (I2C like) driver.
  *
  */
+
 #include <stdbool.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "sccb.h"
 #include <stdio.h>
 #include "sdkconfig.h"
+
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
+#define TAG ""
 #else
 #include "esp_log.h"
 static const char* TAG = "sccb";
 #endif
+
+#define CONFIG_SCCB_HARDWARE_I2C
 
 #define LITTLETOBIG(x)          ((x<<8)|(x>>8))
 
@@ -56,6 +61,14 @@ int SCCB_Init(int pin_sda, int pin_scl)
     twi_init(pin_sda, pin_scl);
 #endif
     return 0;
+}
+
+int SCCB_Deinit() {
+#ifdef CONFIG_SCCB_HARDWARE_I2C
+    i2c_driver_delete(SCCB_I2C_PORT);
+#else
+    
+#endif
 }
 
 uint8_t SCCB_Probe()

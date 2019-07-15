@@ -25,6 +25,8 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 void twi_init(unsigned char sda, unsigned char scl);
 void twi_stop(void);
 void twi_setClock(unsigned int freq);

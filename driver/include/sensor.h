@@ -14,6 +14,8 @@
 #define OV2640_PID     (0x26)
 #define OV7725_PID     (0x77)
 #define OV3660_PID     (0x36)
+#define OV5642_PID     (0x56)
+#define OV5640_PID     (0x56)
 
 typedef enum {
     PIXFORMAT_RGB565,    // 2BPP/RGB565
@@ -39,6 +41,7 @@ typedef enum {
     FRAMESIZE_SXGA,     // 1280x1024
     FRAMESIZE_UXGA,     // 1600x1200
     FRAMESIZE_QXGA,     // 2048*1536
+    FRAMESIZE_QSXGA,     //2592*1944
     FRAMESIZE_INVALID
 } framesize_t;
 

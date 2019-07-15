@@ -1,4 +1,3 @@
-
 const int resolution[][2] = {
     { 160, 120 }, /* QQVGA */
     { 128, 160 }, /* QQVGA2*/
@@ -12,7 +11,5 @@ const int resolution[][2] = {
     { 1280, 1024 }, /* SXGA  */
     { 1600, 1200 }, /* UXGA  */
     { 2048, 1536 }, /* QXGA  */
+    { 2592, 1944 }, /* QSXGA  */
 };
-
-
-
